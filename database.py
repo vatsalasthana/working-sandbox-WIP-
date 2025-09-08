@@ -4,7 +4,6 @@ import pymongo
 from pymongo import MongoClient
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
 import json
 import logging
 from utils import logger
@@ -19,6 +18,7 @@ class DatabaseHandler:
         self.db = None
         self.faiss_index = None
         # self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.embedding_model = None
         self.embedding_model = None
         self.embedding_dimension = 384
         

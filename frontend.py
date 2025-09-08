@@ -9,9 +9,11 @@ import pandas as pd
 from streamlit_ace import st_ace
 import requests
 import io
+from datetime import datetime, timedelta
+import uuid
 
 # Import our agents and components
-from agents import LinearOrchestrator
+from new_agents import LinearOrchestrator  # Updated import
 from database import db_handler
 from prompts import prompts_manager, DEFAULT_PROMPTS
 from utils import progress_tracker
@@ -24,24 +26,65 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-orchestrator = LinearOrchestrator(st)
+# Initialize orchestrator with streamlit instance
+orchestrator = LinearOrchestrator(st)  # Pass st instance
+
+
+def create_collection(name: str):
+    url = f"https://3ce4781230c0.ngrok-free.app/api/v1/collections"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "name": name
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    # Raise an error if request failed
+    response.raise_for_status()
+    
+    return response.json()
+
+
+class ConversationMemory:
+    """Simplified conversation memory manager for display purposes"""
+    
+    def __init__(self, max_history: int = 10, context_window: int = 5):
+        self.max_history = max_history
+        self.context_window = context_window
+    
+    def get_conversation_summary(self, chat_history: List[Dict]) -> str:
+        """Get a summary of the conversation for display"""
+        if not chat_history:
+            return "No conversation history"
+        
+        # Extract topics from recent messages
+        topics = []
+        for msg in chat_history[-5:]:  # Last 5 messages
+            query_words = msg.get('query', '').lower().split()
+            topics.extend([w for w in query_words if len(w) > 4 and w.isalpha()])
+        
+        unique_topics = list(set(topics))[:3]  # Top 3 unique topics
+        
+        return f"{len(chat_history)} messages | Recent topics: {', '.join(unique_topics)}"
+
 
 class FileProcessor:
     def __init__(self):
         self.api_base_url = "https://3ce4781230c0.ngrok-free.app/api/v1/documents"
-        self.collection_id = "sandbox"  # You can make this configurable
+        self.collection_id = "sandbox"
     
     def process_uploaded_file(self, uploaded_file):
         """Upload file to API and track processing status"""
         try:
-            # Step 1: Upload file to API
             job_id = self._upload_file_to_api(uploaded_file)
             
             if not job_id:
                 st.error(f"Failed to upload {uploaded_file.name}")
                 return
             
-            # Step 2: Track job status with Streamlit components
             self._track_job_status(job_id, uploaded_file.name)
             
         except Exception as e:
@@ -50,7 +93,6 @@ class FileProcessor:
     def _upload_file_to_api(self, uploaded_file) -> Optional[str]:
         """Upload file to the API endpoint"""
         try:
-            # Prepare file for upload
             files = {
                 'file': (
                     uploaded_file.name,
@@ -59,12 +101,10 @@ class FileProcessor:
                 )
             }
             
-            # API endpoint
             upload_url = f"{self.api_base_url}/upload"
             params = {'collection': self.collection_id}
             headers = {'accept': 'application/json'}
             
-            # Show upload progress
             with st.spinner(f"Uploading {uploaded_file.name}..."):
                 response = requests.post(
                     upload_url,
@@ -96,12 +136,8 @@ class FileProcessor:
             st.error(f"Upload error for {uploaded_file.name}: {e}")
             return None
 
-
-    def _track_job_status(self, job_id: str, poll_interval: int = 2, max_attempts: int = 30):
-        """
-        Poll API until job finishes or fails.
-        Shows Streamlit progress updates.
-        """
+    def _track_job_status(self, job_id: str, filename: str, poll_interval: int = 2, max_attempts: int = 30):
+        """Poll API until job finishes or fails"""
         status_url = f"{self.api_base_url}/status/{job_id}"
         progress_placeholder = st.empty()
 
@@ -114,20 +150,20 @@ class FileProcessor:
 
                     if status in ["queued", "queued_for_processing", "processing", "in_progress"]:
                         with progress_placeholder.container():
-                            st.info(f"⏳ {job_id} is still {status}... (attempt {attempt+1}/{max_attempts})")
+                            st.info(f"⏳ {filename} is still {status}... (attempt {attempt+1}/{max_attempts})")
                         time.sleep(poll_interval)
                         continue
 
                     elif status in ["completed", "success", "done", "finished"]:
-                        st.success(f"✅ {job_id} processing completed!")
+                        progress_placeholder.success(f"✅ {filename} processing completed!")
                         return result
 
                     elif status in ["failed", "error"]:
-                        st.error(f"❌ {job_id} processing failed: {result}")
+                        progress_placeholder.error(f"❌ {filename} processing failed: {result}")
                         return result
 
                     else:
-                        st.warning(f"⚠️ {job_id} returned unknown status: {status}")
+                        progress_placeholder.warning(f"⚠️ {filename} returned unknown status: {status}")
                         return result
                 else:
                     st.error(f"Error fetching job status: {response.status_code} - {response.text}")
@@ -137,14 +173,16 @@ class FileProcessor:
                 st.error(f"Status check error for job {job_id}: {e}")
                 return None
 
-        st.warning(f"⚠️ Gave up tracking job {job_id} after {max_attempts} attempts.")
+        st.warning(f"⚠️ Gave up tracking {filename} after {max_attempts} attempts.")
         return None
+
 
 class StreamlitUI:
     def __init__(self):
         self.db = db_handler
         self.prompts = prompts_manager
         self.file_processor = FileProcessor()
+        self.memory = ConversationMemory()
         
         # Initialize session state
         if 'processing' not in st.session_state:
@@ -155,21 +193,29 @@ class StreamlitUI:
             st.session_state.uploaded_files = []
         if 'chat_history' not in st.session_state:
             st.session_state.chat_history = []
-        # Initialize model preferences with defaults
-        if 'brain_provider' not in st.session_state:
-            st.session_state.brain_provider = "openai"
-        if 'heart_provider' not in st.session_state:
-            st.session_state.heart_provider = "anthropic"
+        if 'conversation_id' not in st.session_state:
+            st.session_state.conversation_id = f"conv_{int(time.time())}"
+        # UPDATED: Session management for new orchestrator
+        if 'current_session_id' not in st.session_state:
+            st.session_state.current_session_id = str(uuid.uuid4())
+        # UPDATED: Simplified provider settings for new orchestrator
+        if 'supervisor_provider' not in st.session_state:
+            st.session_state.supervisor_provider = "openai"
+        if 'responder_provider' not in st.session_state:
+            st.session_state.responder_provider = "openai"
     
     def run(self):
         """Main UI entry point"""
-        st.title("🧠❤️ Brain-Heart AI System")
+        st.title("🧠❤️ Enhanced AI System with Conversation Memory")
         st.markdown("""
-        **Intelligent Query Processing with Parallel Subtask Execution**
+        **Intelligent Query Processing with Built-in Memory**
         
-        Upload files, ask complex questions, and watch the Brain-Heart system decompose, 
-        process, and synthesize responses using advanced RAG and reasoning techniques.
+        Upload files, ask questions, and engage in contextual conversations. 
+        The system automatically remembers your conversation history.
         """)
+        
+        # UPDATED: Show memory status
+        self._show_memory_status()
         
         col1, col2 = st.columns([2, 1])
         
@@ -178,26 +224,57 @@ class StreamlitUI:
         with col2:
             self.render_sidebar()
         
+        # Conversation History Tab
+        if st.session_state.chat_history:
+            st.divider()
+            self.render_conversation_history()
+        
         if st.session_state.last_result:
             st.divider()
             self.render_results_section()
     
-    # -------------------- Main Interface --------------------
+    def _show_memory_status(self):
+        """Show current memory status"""
+        if st.session_state.chat_history:
+            summary = self.memory.get_conversation_summary(st.session_state.chat_history)
+            st.info(f"💭 Conversation memory: {summary}")
+            st.info(f"🔗 Current Session: {st.session_state.current_session_id[:8]}...")
+    
     def render_main_interface(self):
         st.header("💭 Query Interface")
         self.render_file_upload_section()
         
         st.subheader("Ask Your Question")
+        
+        # UPDATED: Simplified query interface
+        placeholder_text = "Ask me anything about your uploaded files or any topic..."
+        if st.session_state.chat_history:
+            placeholder_text = "Continue our conversation..."
+        
         query = st.text_area(
             "Enter your query:",
             height=100,
-            placeholder="Ask me anything about your uploaded files or any topic...",
-            help="Enter a complex question and watch the Brain-Heart system break it down into subtasks"
+            placeholder=placeholder_text,
+            help="The system automatically uses conversation history for context"
         )
         
-        col1, col2, col3 = st.columns([1, 2, 1])
+        # UPDATED: Simplified controls
+        col1, col2, col3 = st.columns([1, 1, 2])
+        
+        with col1:
+            # Show session info
+            st.caption(f"Session: {st.session_state.current_session_id[:8]}...")
+        
         with col2:
-            if st.button("🧠 Process with Brain-Heart System", type="primary", use_container_width=True):
+            if st.button("🧹 Clear Memory", help="Clear conversation history"):
+                # UPDATED: Clear memory by starting new session
+                self._clear_conversation_memory()
+                st.success("Conversation memory cleared!")
+                time.sleep(1)
+                st.rerun()
+        
+        with col3:
+            if st.button("🧠 Process Query", type="primary", use_container_width=True):
                 if query.strip():
                     self.process_query(query)
                 else:
@@ -206,7 +283,42 @@ class StreamlitUI:
         if st.session_state.processing:
             self.render_processing_interface()
     
-    # -------------------- File Upload --------------------
+    def _clear_conversation_memory(self):
+        """Clear conversation memory by creating new session"""
+        st.session_state.current_session_id = str(uuid.uuid4())
+        st.session_state.chat_history = []
+        st.session_state.conversation_id = f"conv_{int(time.time())}"
+    
+    async def _get_conversation_history_async(self):
+        """Get conversation history from LangGraph memory"""
+        try:
+            # UPDATED: Use the memory system from the orchestrator
+            from langgraph.checkpoint.base import BaseCheckpointSaver
+            
+            # Get checkpoints for current session
+            config = {"configurable": {"thread_id": st.session_state.current_session_id}}
+            
+            # Try to get history from the memory saver
+            history = []
+            try:
+                # This is a simplified approach - you might need to adjust based on your actual memory implementation
+                checkpoint = orchestrator.memory.get(config)
+                if checkpoint:
+                    messages = checkpoint.get('channel_values', {}).get('messages', [])
+                    for msg in messages:
+                        if hasattr(msg, 'content'):
+                            history.append({
+                                'role': getattr(msg, 'type', 'unknown'),
+                                'content': msg.content
+                            })
+            except Exception as e:
+                st.error(f"Error accessing memory: {e}")
+                
+            return history
+        except Exception as e:
+            st.error(f"Error getting conversation history: {e}")
+            return []
+    
     def render_file_upload_section(self):
         st.subheader("📁 File Upload")
         
@@ -220,10 +332,8 @@ class StreamlitUI:
             for uploaded_file in uploaded_files:
                 if uploaded_file.name not in [f['filename'] for f in st.session_state.uploaded_files]:
                     with st.spinner(f"Processing {uploaded_file.name}..."):
-                        # ✅ Delegate file handling to FileProcessor
                         self.file_processor.process_uploaded_file(uploaded_file)
                         
-                        # Optionally track uploaded file locally
                         st.session_state.uploaded_files.append({
                             "filename": uploaded_file.name,
                             "file_type": uploaded_file.type,
@@ -237,7 +347,6 @@ class StreamlitUI:
                 with col1:
                     st.text(f"📄 {file_info['filename']} ({file_info['file_type']})")
                 with col2:
-                    # Just remove from session state (since API owns persistence now)
                     if st.button("🗑️", key=f"delete_{file_info['filename']}", help="Remove file"):
                         st.session_state.uploaded_files = [
                             f for f in st.session_state.uploaded_files 
@@ -245,7 +354,56 @@ class StreamlitUI:
                         ]
                         st.rerun()
     
-    # -------------------- Sidebar --------------------
+    def render_conversation_history(self):
+        st.header("💬 Conversation History")
+        
+        # UPDATED: History controls
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.markdown(f"**Session:** `{st.session_state.current_session_id[:12]}...`")
+        with col2:
+            if st.button("📥 Export Chat", help="Export conversation as JSON"):
+                chat_data = {
+                    "conversation_id": st.session_state.conversation_id,
+                    "session_id": st.session_state.current_session_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "messages": st.session_state.chat_history
+                }
+                st.download_button(
+                    "Download JSON",
+                    data=json.dumps(chat_data, indent=2),
+                    file_name=f"conversation_{st.session_state.conversation_id}.json",
+                    mime="application/json"
+                )
+        with col3:
+            if st.button("📜 Show LangGraph History", help="Show internal conversation history"):
+                # UPDATED: Use async function to get history
+                try:
+                    history = asyncio.run(self._get_conversation_history_async())
+                    with st.expander("LangGraph Memory History", expanded=True):
+                        if history:
+                            for i, msg in enumerate(history):
+                                st.text(f"{i+1}. {msg['role']}: {msg['content'][:200]}...")
+                        else:
+                            st.info("No LangGraph history available")
+                except Exception as e:
+                    st.error(f"Error fetching LangGraph history: {e}")
+        
+        # Display local chat history
+        for i, msg in enumerate(reversed(st.session_state.chat_history[-10:])):  # Show last 10
+            timestamp = datetime.fromtimestamp(msg.get('timestamp', 0)).strftime("%Y-%m-%d %H:%M:%S")
+            status_emoji = "✅" if msg.get('status') == 'success' else "❌"
+            
+            with st.expander(f"{status_emoji} [{timestamp}] {msg.get('query', '')[:50]}...", expanded=False):
+                st.markdown("**Query:**")
+                st.text(msg.get('query', ''))
+                st.markdown("**Response:**")
+                st.text(msg.get('response', ''))
+                
+                # UPDATED: Show memory usage info
+                if msg.get('session_id'):
+                    st.info(f"🔗 Session: {msg['session_id'][:12]}...")
+    
     def render_sidebar(self):
         st.header("⚙️ System Controls")
         self.render_system_status()
@@ -255,7 +413,6 @@ class StreamlitUI:
         
         st.subheader("🔧 Settings")
         self.render_settings()
-        
     
     def render_system_status(self):
         with st.expander("🔍 System Status", expanded=False):
@@ -270,21 +427,22 @@ class StreamlitUI:
             else:
                 st.metric("Embeddings", "Error")
             
-            # Show current model selection
+            # UPDATED: Show new provider settings
             st.markdown("**Current Model Selection:**")
-            st.text(f"Brain Agent: {st.session_state.brain_provider}")
-            st.text(f"Heart Agent: {st.session_state.heart_provider}")
+            st.text(f"Supervisor: {st.session_state.supervisor_provider}")
+            st.text(f"Responder: {st.session_state.responder_provider}")
             
-            llm_status = {}
+            # Memory status
+            st.markdown("**Memory Status:**")
+            st.text(f"Local Messages: {len(st.session_state.chat_history)}")
+            st.text(f"Session ID: {st.session_state.current_session_id[:12]}...")
+            
+            # Show LangGraph memory status
             try:
-                from tools import tool_executor
-                for provider, llm in tool_executor.llms.items():
-                    llm_status[provider] = "✅ Connected" if llm else "❌ Unavailable"
+                history = asyncio.run(self._get_conversation_history_async())
+                st.text(f"LangGraph Messages: {len(history)}")
             except:
-                llm_status = {"Status": "❌ Error"}
-            
-            for provider, status in llm_status.items():
-                st.text(f"{provider.title()}: {status}")
+                st.text("LangGraph Messages: Error")
     
     def render_prompt_editor(self):
         with st.expander("Edit System Prompts", expanded=False):
@@ -324,45 +482,49 @@ class StreamlitUI:
     
     def render_settings(self):
         with st.expander("System Settings", expanded=False):
-            max_retries = st.slider("Max Retries for Critical Tasks", 1, 5, 3)
-            critical_threshold = st.slider("Critical Weight Threshold", 0.5, 1.0, 0.8, 0.1)
+            st.markdown("**LLM Provider Settings:**")
             
-            st.markdown("**LLM Provider Preferences:**")
-            
-            # Use callback to update session state when selection changes
-            brain_provider = st.selectbox(
-                "Brain Agent LLM", 
-                ["openai", "anthropic", "openrouter"], 
-                index=["openai", "anthropic", "openrouter"].index(st.session_state.brain_provider),
-                key="brain_provider_selector"
+            # UPDATED: New provider settings for the new orchestrator
+            supervisor_provider = st.selectbox(
+                "Supervisor Agent LLM", 
+                ["openai", "openrouter"], 
+                index=["openai", "openrouter"].index(st.session_state.supervisor_provider),
+                key="supervisor_provider_selector"
             )
             
-            heart_provider = st.selectbox(
-                "Heart Agent LLM", 
-                ["anthropic", "openai", "openrouter"], 
-                index=["anthropic", "openai", "openrouter"].index(st.session_state.heart_provider),
-                key="heart_provider_selector"
+            responder_provider = st.selectbox(
+                "Final Responder LLM", 
+                ["openai", "openrouter"], 
+                index=["openai", "openrouter"].index(st.session_state.responder_provider),
+                key="responder_provider_selector"
             )
             
-            # Update session state immediately when selection changes
-            if brain_provider != st.session_state.brain_provider:
-                st.session_state.brain_provider = brain_provider
-                st.success(f"Brain Agent LLM updated to: {brain_provider}")
+            if supervisor_provider != st.session_state.supervisor_provider:
+                st.session_state.supervisor_provider = supervisor_provider
+                st.success(f"Supervisor LLM updated to: {supervisor_provider}")
                 
-            if heart_provider != st.session_state.heart_provider:
-                st.session_state.heart_provider = heart_provider
-                st.success(f"Heart Agent LLM updated to: {heart_provider}")
+            if responder_provider != st.session_state.responder_provider:
+                st.session_state.responder_provider = responder_provider
+                st.success(f"Responder LLM updated to: {responder_provider}")
             
-            # Store settings in session state for persistence
-            st.session_state.max_retries = max_retries
-            st.session_state.critical_threshold = critical_threshold
+            # Memory settings
+            st.markdown("**Memory Settings:**")
+            if st.button("🔄 Reset LangGraph Memory", help="Clear LangGraph conversation memory"):
+                try:
+                    self._clear_conversation_memory()
+                    st.success("✅ LangGraph memory cleared!")
+                except Exception as e:
+                    st.error(f"Error clearing memory: {e}")
             
             if st.button("🗑️ Clear Cache"):
                 from utils import cache
-                cache.cache.clear()
-                st.success("Cache cleared!")
+                if hasattr(cache, 'cache'):
+                    cache.cache.clear()
+                    st.success("Cache cleared!")
+                else:
+                    st.info("No cache to clear")
 
-            if st.button("🗑️ Delete Collection", type="primary"):
+            if st.button("🗑️ Delete Collection", type="secondary"):
                 try:
                     delete_url = f"https://3ce4781230c0.ngrok-free.app/api/v1/collections/"
                     params = {"collection_name": self.file_processor.collection_id}
@@ -371,46 +533,29 @@ class StreamlitUI:
 
                     if resp.status_code == 200:
                         st.success(f"✅ Collection '{self.file_processor.collection_id}' deleted successfully!")
+                        create_collection('sandbox')
                     else:
                         st.error(f"❌ Failed to delete collection: {resp.status_code} - {resp.text}")
                 except Exception as e:
                     st.error(f"Error deleting collection: {e}")
     
-    # -------------------- Processing --------------------
     def render_processing_interface(self):
         st.subheader("🔄 Processing Status")
-        progress_container = st.container()
         
-        with progress_container:
-            progress_data = progress_tracker.get_progress()
-            overall_progress = progress_data['progress_percentage'] / 100
-            st.progress(overall_progress, text=f"Overall Progress: {progress_data['progress_percentage']:.1f}%")
+        # Simple progress indicator for the new system
+        with st.container():
+            st.info("🧠 Processing query with conversation memory...")
+            progress_bar = st.progress(0)
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Tasks", progress_data['total_tasks'])
-            with col2:
-                st.metric("Completed", progress_data['completed_tasks'])
-            with col3:
-                st.metric("Running", progress_data['running_tasks'])
-            with col4:
-                st.metric("Failed", progress_data['failed_tasks'])
-            
-            if progress_data['tasks']:
-                st.markdown("**Task Details:**")
-                for task_id, task_info in progress_data['tasks'].items():
-                    status_emoji = {'pending': '⏳', 'running': '🔄', 'completed': '✅', 'failed': '❌'}
-                    emoji = status_emoji.get(task_info['status'], '❓')
-                    weight_bar = "█" * int(task_info['weight'] * 10)
-                    st.text(f"{emoji} {task_id}: {task_info['description']}")
-                    st.text(f"   Weight: {weight_bar} ({task_info['weight']:.1f})")
-                    if task_info['status'] == 'failed' and task_info.get('error'):
-                        st.error(f"   Error: {task_info['error']}")
+            # Simulate progress (you could enhance this with actual progress tracking)
+            for i in range(100):
+                time.sleep(0.01)
+                progress_bar.progress(i + 1)
     
-    # -------------------- Results --------------------
     def render_results_section(self):
         st.header("📊 Results")
         result = st.session_state.last_result
+        
         if result['status'] == 'error':
             st.error(f"Processing failed: {result.get('error', 'Unknown error')}")
             return
@@ -418,268 +563,139 @@ class StreamlitUI:
         st.subheader("💬 Final Response")
         st.markdown(result['final_response'])
         
-        tab1, tab2, tab3, tab4 = st.tabs(["📈 Analysis", "🧠 Brain Results", "❤️ Heart Results", "🔍 Raw Data"])
-        with tab1: self.render_analysis_tab(result)
-        with tab2: self.render_brain_results_tab(result.get('brain_result', {}))
-        with tab3: self.render_heart_results_tab(result.get('heart_result', {}))
-        with tab4: self.render_raw_data_tab(result)
-    
-    def render_analysis_tab(self, result: Dict):
-        st.subheader("Processing Analysis")
-        brain_result = result.get('brain_result', {})
-        heart_result = result.get('heart_result', {})
-        
+        # UPDATED: Show memory and session info
         col1, col2, col3 = st.columns(3)
         with col1:
+            if result.get('session_id'):
+                st.info(f"🔗 Session: {result['session_id'][:12]}...")
+        with col2:
+            tool_count = len(result.get('tool_results', []))
+            st.info(f"🔧 Tools used: {tool_count}")
+        with col3:
             status_color = "green" if result['status'] == 'success' else "red"
             st.markdown(f"**Status:** <span style='color:{status_color}'>{result['status']}</span>", unsafe_allow_html=True)
-        with col2:
-            fallback_used = result.get('used_fallback', False)
-            fallback_color = "orange" if fallback_used else "green"
-            fallback_text = "Yes" if fallback_used else "No"
-            st.markdown(f"**Fallback Used:** <span style='color:{fallback_color}'>{fallback_text}</span>", unsafe_allow_html=True)
-        with col3:
-            processing_time = brain_result.get('processing_time', 0)
-            st.markdown(f"**Processing Time:** {processing_time:.2f}s")
         
-        if brain_result.get('results'):
-            self.render_task_execution_chart(brain_result['results'])
-        if heart_result.get('qa_assessment'):
-            self.render_quality_assessment(heart_result['qa_assessment'])
-    
-    def render_task_execution_chart(self, task_results: List[Dict]):
-        st.subheader("Task Execution Overview")
-        tasks_data = []
-        for result in task_results:
-            tasks_data.append({
-                'Task ID': result.get('task_id', 'Unknown'),
-                'Status': result.get('status', 'Unknown'),
-                'Weight': result.get('weight', 0.5),
-                'Type': result.get('task_type', 'Unknown'),
-                'LLM Provider': result.get('llm_provider', 'Unknown')
-            })
-        df = pd.DataFrame(tasks_data)
+        # UPDATED: Simplified tabs for new system
+        tab1, tab2 = st.tabs(["🔍 Tool Results", "🔍 Raw Data"])
         
-        col1, col2 = st.columns(2)
-        with col1:
-            status_counts = df['Status'].value_counts()
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=status_counts.index,
-                values=status_counts.values,
-                hole=0.3,
-                marker_colors=['#2E8B57', '#DC143C', '#FFA500', '#4169E1']
-            )])
-            fig_pie.update_layout(title="Task Status Distribution", height=400)
-            st.plotly_chart(fig_pie, use_container_width=True)
-        with col2:
-            color_map = {'completed': '#2E8B57', 'failed': '#DC143C', 'pending': '#FFA500'}
-            fig_scatter = go.Figure()
-            for status in df['Status'].unique():
-                status_data = df[df['Status'] == status]
-                fig_scatter.add_trace(go.Scatter(
-                    x=status_data.index,
-                    y=status_data['Weight'],
-                    mode='markers',
-                    name=status,
-                    marker=dict(size=15, color=color_map.get(status, '#808080'), opacity=0.7),
-                    text=status_data['Task ID'],
-                    hovertemplate='<b>%{text}</b><br>Weight: %{y}<br>Status: ' + status
-                ))
-            fig_scatter.update_layout(title="Task Weight vs Execution Order", xaxis_title="Execution Order", yaxis_title="Task Weight", height=400)
-            st.plotly_chart(fig_scatter, use_container_width=True)
+        with tab1:
+            self.render_tool_results_tab(result.get('tool_results', []))
+        with tab2:
+            self.render_raw_data_tab(result)
+    
+    def render_tool_results_tab(self, tool_results: List[Dict]):
+        st.subheader("🔧 Tool Execution Results")
         
-        st.subheader("Task Details")
-        st.dataframe(df, use_container_width=True)
-    
-    def render_quality_assessment(self, qa_assessment: Dict):
-        st.subheader("Response Quality Assessment")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            content_color = "green" if qa_assessment.get('has_content') else "red"
-            st.markdown(f"**Has Content:** <span style='color:{content_color}'>{'✅' if qa_assessment.get('has_content') else '❌'}</span>", unsafe_allow_html=True)
-        with col2:
-            rag_color = "green" if qa_assessment.get('has_rag_context') else "orange"
-            st.markdown(f"**RAG Context:** <span style='color:{rag_color}'>{'✅' if qa_assessment.get('has_rag_context') else '⚠️'}</span>", unsafe_allow_html=True)
-        with col3:
-            analysis_color = "green" if qa_assessment.get('has_analysis') else "orange"
-            st.markdown(f"**Analysis:** <span style='color:{analysis_color}'>{'✅' if qa_assessment.get('has_analysis') else '⚠️'}</span>", unsafe_allow_html=True)
-        with col4:
-            confidence_score = qa_assessment.get('confidence_score', 0)
-            confidence_color = "green" if confidence_score > 0.7 else "orange" if confidence_score > 0.4 else "red"
-            st.markdown(f"**Confidence:** <span style='color:{confidence_color}'>{confidence_score:.2f}</span>", unsafe_allow_html=True)
-    
-    # -------------------- Brain / Heart / Raw --------------------
-    def render_brain_results_tab(self, brain_result: Dict):
-        st.subheader("🧠 Brain Agent Output")
-        if not brain_result:
-            st.info("No Brain agent data available")
+        if not tool_results:
+            st.info("No tools were used for this query")
             return
         
-        subtasks = brain_result.get('subtasks', [])
-        if subtasks:
-            st.markdown("**Generated Subtasks:**")
-            for i, task in enumerate(subtasks, 1):
-                with st.expander(f"Task {i}: {task.get('task_id', 'Unknown')}", expanded=False):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.json({
-                            'Description': task.get('description', ''),
-                            'Weight': task.get('weight', 0),
-                            'Dependencies': task.get('depends_on', []),
-                            'Type': task.get('task_type', ''),
-                            'LLM Provider': task.get('llm_provider', '')
-                        })
-                    with col2:
-                        st.markdown("**Parameters:**")
-                        st.json(task.get('parameters', {}))
-        
-        results = brain_result.get('results', [])
-        if results:
-            st.markdown("**Execution Results:**")
-            for result in results:
-                status_emoji = "✅" if result.get('status') == 'completed' else "❌"
-                with st.expander(f"{status_emoji} {result.get('task_id', 'Unknown')}", expanded=False):
-                    if result.get('status') == 'completed':
-                        st.success("Task completed successfully")
-                        st.markdown("**Result:**")
-                        st.text_area("", value=str(result.get('result', '')), height=100, disabled=True)
-                        if result.get('context'):
-                            st.markdown("**Retrieved Context:**")
-                            for ctx in result['context'][:3]:
-                                st.markdown(f"- Similarity: {ctx.get('similarity', 0):.3f}")
-                                st.text(ctx.get('text', '')[:200] + "..." if len(ctx.get('text', '')) > 200 else ctx.get('text', ''))
-                    else:
-                        st.error(f"Task failed: {result.get('error', 'Unknown error')}")
-    
-    def render_heart_results_tab(self, heart_result: Dict):
-        st.subheader("❤️ Heart Agent Output")
-        if not heart_result:
-            st.info("No Heart agent data available")
-            return
-        
-        analysis = heart_result.get('analysis', {})
-        if analysis:
-            st.markdown("**Response Assembly Analysis:**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Success Rate", f"{analysis.get('success_rate', 0):.2%}")
-                st.metric("Completed Tasks", f"{analysis.get('completed_tasks', 0)}/{analysis.get('total_tasks', 0)}")
-            with col2:
-                critical_failures = analysis.get('has_critical_failures', False)
-                st.markdown(f"**Critical Failures:** {'❌ Yes' if critical_failures else '✅ No'}")
-                st.metric("Failed Tasks", analysis.get('failed_tasks', 0))
-        
-        qa_assessment = heart_result.get('qa_assessment', {})
-        if qa_assessment:
-            with st.expander("Quality Assessment Details", expanded=True):
-                st.json(qa_assessment)
-        
-        if heart_result.get('used_fallback'):
-            st.warning("⚠️ Fallback strategies were used due to incomplete subtask results")
+        for i, result in enumerate(tool_results):
+            source = result.get('source', 'unknown_tool')
+            status = result.get('status', 'unknown')
+            
+            status_emoji = "✅" if status == 'success' else "❌"
+            
+            with st.expander(f"{status_emoji} {source.title()} - {status}", expanded=False):
+                if status == 'success':
+                    if result.get('context'):
+                        st.markdown("**Retrieved Context:**")
+                        st.text_area("Context", value=result['context'], height=200, disabled=True)
+                    
+                    if result.get('results'):
+                        st.markdown(f"**Results:** {result.get('total_results', 0)} items found")
+                        
+                        # Show first few results
+                        for j, item in enumerate(result['results'][:3]):
+                            st.markdown(f"**Result {j+1}:**")
+                            if isinstance(item, dict):
+                                st.json(item)
+                            else:
+                                st.text(str(item))
+                else:
+                    st.error(f"Tool failed: {result.get('error', 'Unknown error')}")
     
     def render_raw_data_tab(self, result: Dict):
         st.subheader("🔍 Raw Processing Data")
         st.json(result)
     
-    # -------------------- File Handling --------------------
-    def process_uploaded_file(self, uploaded_file):
-        try:
-            content = uploaded_file.read()
-            file_type = uploaded_file.type or "unknown"
-            file_id = self.db.save_file(
-                filename=uploaded_file.name,
-                content=content,
-                file_type=file_type,
-                metadata={'size': len(content)}
-            )
-            
-            if file_type.startswith('text/') or uploaded_file.name.endswith(('.txt', '.md', '.py', '.js', '.html', '.css')):
-                text_content = content.decode('utf-8', errors='ignore')
-                chunks = self.chunk_text(text_content)
-                self.db.index_file_content(file_id, chunks)
-            else:
-                metadata_text = f"File: {uploaded_file.name}, Type: {file_type}, Size: {len(content)} bytes"
-                self.db.index_file_content(file_id, [metadata_text])
-            
-            st.session_state.uploaded_files.append({
-                'file_id': file_id,
-                'filename': uploaded_file.name,
-                'file_type': file_type,
-                'size': len(content)
-            })
-            st.success(f"✅ {uploaded_file.name} uploaded and indexed successfully!")
-            
-        except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {e}")
-    
-    def chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        words = text.split()
-        chunks = []
-        for i in range(0, len(words), chunk_size):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
-        return chunks if chunks else [text]
-    
-    def remove_file(self, file_id: str):
-        try:
-            st.session_state.uploaded_files = [f for f in st.session_state.uploaded_files if f['file_id'] != file_id]
-            st.success("File removed successfully!")
-        except Exception as e:
-            st.error(f"Error removing file: {e}")
-    
-    # -------------------- Query Execution --------------------
     def process_query(self, query: str):
+        """UPDATED: Process query using new LinearOrchestrator"""
         st.session_state.processing = True
-        progress_placeholder = st.empty()
         
         try:
-            with progress_placeholder.container():
-                st.info("🧠 Brain-Heart system is processing your query...")
+            with st.spinner("🧠 Processing query..."):
+                # UPDATED: Use the new orchestrator interface with session management
+                result = asyncio.run(self._process_query_with_session(query))
                 
-                # Show current model selection in processing
-                st.info(
-                    f"Using Brain Agent: {st.session_state.brain_provider} | "
-                    f"Heart Agent: {st.session_state.heart_provider}"
-                )
+                # UPDATED: Handle the new response format
+                final_response = result.get("response", "No response received")
+                session_id = result.get("session", st.session_state.current_session_id)
                 
-                available_files = self.db.get_all_files()
-                
-                # ✅ Create configuration dictionary to pass model preferences
-                config = {
-                    "brain_provider": st.session_state.get("brain_provider", "openai"),
-                    "heart_provider": st.session_state.get("heart_provider", "anthropic"),
-                    "max_retries": st.session_state.get("max_retries", 3),
-                    "critical_threshold": st.session_state.get("critical_threshold", 0.8),
+                # Store result and update history
+                processed_result = {
+                    "status": "success",
+                    "final_response": final_response,
+                    "session_id": session_id,
+                    "tool_results": [],  # The new orchestrator doesn't return detailed tool results
                 }
                 
-                # ✅ Pass config to orchestrator (new 3rd argument)
-                result = asyncio.run(orchestrator.process_query(query, available_files))
-
-                # Save result + history
-                st.session_state.last_result = result
+                st.session_state.last_result = processed_result
                 st.session_state.chat_history.append({
                     "query": query,
-                    "response": result["final_response"],
+                    "response": final_response,
                     "timestamp": time.time(),
-                    "status": result["status"],
+                    "status": "success",
+                    "session_id": session_id,
+                    "conversation_id": st.session_state.conversation_id
                 })
+                
+                # Update current session ID if it changed
+                st.session_state.current_session_id = session_id
 
-            progress_placeholder.empty()
             st.success("✅ Processing completed!")
             time.sleep(1)
             st.rerun()
 
         except Exception as e:
-            progress_placeholder.empty()
             st.error(f"❌ Processing failed: {e}")
             st.session_state.last_result = {
                 "status": "error",
                 "final_response": f"I apologize, but I encountered an error: {e}",
                 "error": str(e),
+                "session_id": st.session_state.current_session_id,
+                "tool_results": []
             }
         finally:
             st.session_state.processing = False
+    
+    async def _process_query_with_session(self, query: str):
+        """Process query with session management for memory continuity"""
+        from agents import AgentState
+        from langchain_core.messages import HumanMessage
+        
+        # UPDATED: Use existing session ID for continuity or current for new queries
+        session_id = st.session_state.current_session_id
+        
+        # Create state for the orchestrator
+        state = AgentState(
+            messages=[HumanMessage(content=query)],
+            user_query=query,
+            available_files=st.session_state.uploaded_files,
+            tool_results=[],
+            final_response="",
+            conversation_summary=None,
+            session_id=session_id
+        )
+        
+        # Use the graph directly with session management
+        config = {"configurable": {"thread_id": session_id}}
+        result = await orchestrator.graph.ainvoke(state, config=config)
+        
+        return {
+            "response": result.get("final_response", "No response generated"),
+            "session": session_id
+        }
 
 
 def run_frontend():

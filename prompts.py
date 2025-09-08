@@ -1,5 +1,7 @@
 from typing import Dict, Optional
-from database import db_handler
+# from database import db_handler
+
+db_handler = None  # Placeholder for actual db_handler import
 
 # Default prompts
 DEFAULT_PROMPTS = {
@@ -57,6 +59,7 @@ Instructions:
 2. Extract key information that directly answers the query
 3. Note any gaps in the available information
 4. Provide a structured summary of findings
+5. Answer the user query as best as possible using the context
 
 Response:""",
 
